@@ -1,0 +1,32 @@
+package com.swp391.beswp.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class MemberClassBookingRequest {
+
+    private Integer classId;
+
+    /**
+     * Hình thức thanh toán:
+     * - "PACKAGE" hoặc "Sử dụng gói hội viên"
+     * - "DIRECT" hoặc "Thanh toán trực tiếp"
+     */
+    @NotBlank(message = "Vui lòng chọn hình thức thanh toán ('PACKAGE' hoặc 'DIRECT')")
+    private String paymentMethod;
+
+    /**
+     * Kênh thanh toán (DIRECT):
+     * "Bank_Transfer", "Cash", "Card", "E_Wallet"
+     * Card: VNPay; E_Wallet: SePay QR (Pending until authenticated webhook).
+     */
+    private String paymentChannel;
+
+}

@@ -1,0 +1,132 @@
+.manager-summary .dashboard-card {
+  align-content: start;
+}
+
+.manager-dashboard-analytics {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.manager-open-finance-link,
+.manager-open-finance-link:visited {
+  color: #2e7d5b;
+  font-size: 14px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.manager-open-finance-link:hover {
+  color: #205b42;
+  text-decoration: none;
+}
+
+.manager-analytics-card {
+  min-width: 0;
+  padding: 22px;
+  border: 1px solid #e4eee6;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 12px 36px rgba(22, 41, 31, 0.06);
+}
+
+.manager-analytics-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.manager-analytics-heading h3 {
+  margin: 5px 0 0;
+  color: #17251e;
+  font-size: 20px;
+}
+
+.manager-analytics-heading > .material-symbols-outlined {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  border-radius: 14px;
+  background: #eaf4ed;
+  color: #2e7d5b;
+  font-size: 23px;
+}
+
+.manager-status-chart {
+  display: flex;
+  min-height: 220px;
+  align-items: center;
+  justify-content: center;
+  gap: clamp(24px, 5vw, 64px);
+  padding: 8px 0;
+}
+
+.manager-status-donut {
+  display: grid;
+  width: 184px;
+  height: 184px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 50%;
+  position: relative;
+}
+
+.manager-status-donut::before {
+  position: absolute;
+  width: 122px;
+  height: 122px;
+  border-radius: 50%;
+  background: #fff;
+  content: '';
+}
+
+.manager-status-donut-center {
+  z-index: 1;
+  display: grid;
+  gap: 3px;
+  text-align: center;
+}
+
+.manager-status-donut-center strong {
+  color: #183127;
+  font-size: 30px;
+  line-height: 1;
+}
+
+.manager-status-donut-center span,
+.manager-chart-empty {
+  color: #778980;
+  font-size: 13px;
+}
+
+.manager-status-legend {
+  display: grid;
+  width: min(100%, 320px);
+  gap: 13px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.manager-status-legend li {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 9px;
+  color: #31483c;
+  font-size: 13px;
+}
+
+.manager-status-legend strong { color: #183127; }
+.manager-status-legend small { min-width: 38px; color: #778980; text-align: right; }
+.manager-status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--status-color); }
+.manager-chart-empty { margin: 0; padding: 42px 12px; text-align: center; }
+.manager-chart-empty.is-error { color: #a93838; }
+
+@media (max-width: 560px) {
+  .manager-analytics-card { padding: 18px; }
+  .manager-status-chart { flex-direction: column; gap: 22px; }
+  .manager-status-legend { width: 100%; }
+}

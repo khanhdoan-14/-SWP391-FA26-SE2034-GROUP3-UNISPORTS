@@ -1,0 +1,866 @@
+package com.swp391.beswp.service;
+
+import com.swp391.beswp.dto.AvailableClassCardResponse;
+import com.swp391.beswp.dto.AvailableClassListResponse;
+import com.swp391.beswp.dto.ClassConfirmationDetailResponse;
+import com.swp391.beswp.dto.MemberClassBookingRequest;
+import com.swp391.beswp.dto.MemberClassBookingResponse;
+import com.swp391.beswp.dto.MemberSubscriptionInfoResponse;
+import com.swp391.beswp.dto.MyClassItemResponse;
+import com.swp391.beswp.dto.MyClassListResponse;
+import com.swp391.beswp.dto.MemberClassSessionData;
+import com.swp391.beswp.entity.ActivityLog;
+import com.swp391.beswp.entity.ClassBooking;
+import com.swp391.beswp.entity.ClassEntity;
+import com.swp391.beswp.entity.ClassSession;
+import com.swp391.beswp.entity.MemberSubscription;
+import com.swp391.beswp.entity.Payment;
+import com.swp391.beswp.entity.Subject;
+import com.swp391.beswp.entity.User;
+import com.swp391.beswp.repository.ActivityLogRepository;
+import com.swp391.beswp.repository.ClassBookingRepository;
+import com.swp391.beswp.repository.ClassRepository;
+import com.swp391.beswp.repository.ClassSessionRepository;
+import com.swp391.beswp.repository.CoachAttendanceRepository;
+import com.swp391.beswp.repository.MemberSubscriptionRepository;
+import com.swp391.beswp.repository.MembershipIncludedSportRepository;
+import com.swp391.beswp.repository.MembershipSportSelectionRepository;
+import com.swp391.beswp.repository.PaymentRepository;
+import com.swp391.beswp.repository.SubjectRepository;
+import com.swp391.beswp.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
+import org.springframework.web.server.ResponseStatusException;
+
+import java.math.BigDecimal;
+import java.text.DecimalFormat;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.Map;
+import java.util.LinkedHashMap;
+import java.util.Comparator;
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+public class MemberClassBookingService {
+
+    private final ClassRepository classRepository;
+    private final ClassSessionRepository classSessionRepository;
+    private final ClassBookingRepository classBookingRepository;
+    private final MemberSubscriptionRepository memberSubscriptionRepository;
+    private final MembershipIncludedSportRepository membershipIncludedSports;
+    private final MembershipSportSelectionRepository membershipSelections;
+    private final PaymentRepository paymentRepository;
+    private final ActivityLogRepository activityLogRepository;
+    private final UserRepository userRepository;
+    private final SubjectRepository subjectRepository;
+    private final VnpayService vnpayService;
+    private final SepayService sepayService;
+    private final ClassReservationService reservationService;
+    private final java.time.Clock paymentClock;
+    private final RefundService refunds;
+    private final CoachAttendanceRepository attendanceRepository;
+
+    private static final DecimalFormat CURRENCY_FORMAT = new DecimalFormat("#,###");
+
+    /**
+     * Màn hình 1: "Lớp học của tôi"
+     * Lấy danh sách lớp đã đăng ký của hội viên kèm số lượng theo từng trạng thái.
+     */
+    @Transactional(readOnly = true)
+    public MyClassListResponse getMyClasses(String principal, String status, String search) {
+        User user = findMemberUser(principal);
+
+        String resolvedStatus = resolveBookingStatusQuery(status);
+        String keyword = StringUtils.hasText(search) ? search.trim().toLowerCase(Locale.ROOT) : null;
+
+        List<ClassBooking> allBookings = classBookingRepository.findMyBookings(user.getId(), null, null);
+        Map<Integer, String> attendanceBySession = new LinkedHashMap<>();
+        if (!allBookings.isEmpty()) {
+            List<Integer> sessionIds = allBookings.stream().map(b -> b.getSession().getId()).distinct().toList();
+            attendanceRepository.findByUser_IdAndSession_IdIn(user.getId(), sessionIds)
+                    .forEach(record -> attendanceBySession.put(record.getSession().getId(), record.getStatus()));
+        }
+        LocalDate today = LocalDate.now(paymentClock);
+        Map<String, List<ClassBooking>> groups = new LinkedHashMap<>();
+        for (ClassBooking booking : allBookings) {
+            String key = booking.getRegistrationCode() == null ? "legacy:" + booking.getId() : booking.getRegistrationCode();
+            groups.computeIfAbsent(key, ignored -> new ArrayList<>()).add(booking);
+        }
+
+        List<MyClassItemResponse> allItems = groups.values().stream().map(group -> {
+            ClassBooking b = group.stream().min(Comparator.comparing(ClassBooking::getId)).orElseThrow();
+            ClassSession session = b.getSession();
+            ClassEntity classEntity = session.getClassEntity();
+            List<Payment> payments = paymentRepository.findAllByBooking_IdOrderByIdDesc(b.getId());
+            Payment payment = payments.isEmpty() ? null : payments.getFirst();
+
+            boolean hasDirectPayment = group.stream().anyMatch(item -> "DIRECT".equals(item.getPaymentMethod())) || (b.getPaymentMethod() == null
+                    && paymentRepository.existsByBooking_IdAndStatusIgnoreCase(b.getId(), "Paid"));
+            boolean hasPackageSessions = group.stream().anyMatch(item -> "PACKAGE".equals(item.getPaymentMethod()));
+            String paymentMethod = hasDirectPayment && hasPackageSessions ? "Gói hội viên + thanh toán phần thiếu"
+                    : hasDirectPayment ? "Thanh toán trực tiếp" : "Sử dụng gói hội viên";
+
+            String rawStatus = registrationStatus(group, today);
+            String displayStatus = mapBookingDisplayStatus(rawStatus);
+            LocalDateTime cancellationNow = LocalDateTime.now(paymentClock);
+            boolean canCancel = ("Booked".equals(rawStatus) || "Pending".equals(rawStatus))
+                    && cancellationWindowOpen(group, cancellationNow)
+                    && group.stream().anyMatch(item -> item.getSession().getDate().atTime(item.getSession().getStartTime())
+                    .isAfter(cancellationNow));
+            boolean canRebook = ("Completed".equalsIgnoreCase(rawStatus) || "Cancelled".equalsIgnoreCase(rawStatus))
+                    && ClassSchedule.notStarted(classEntity, LocalDateTime.now(paymentClock))
+                    && ClassSchedule.isOpen(classEntity) && !ClassSchedule.expired(classEntity, today);
+
+            String coachName = classEntity.getCoach() != null ? "HLV " + classEntity.getCoach().getFullName() : "Chưa cập nhật";
+            String coachAvatar = classEntity.getCoach() != null ? getInitials(classEntity.getCoach().getFullName()) : "HLV";
+
+            String schedule = StringUtils.hasText(classEntity.getDaysOfWeek())
+                    ? String.join(", ", ClassSchedule.normalizeDays(classEntity.getDaysOfWeek())) : "Theo lịch";
+            String timeSlot = formatTimeRange(session.getStartTime(), session.getEndTime());
+
+            return MyClassItemResponse.builder()
+                    .registrationId(b.getId()).sessionCount(group.size())
+                    .sessions(group.stream().sorted(Comparator.comparing((ClassBooking item) -> item.getSession().getDate())
+                            .thenComparing(item -> item.getSession().getStartTime()))
+                            .map(item -> sessionData(item.getSession(), ClassSchedule.bookingStatus(item, today),
+                                    attendanceBySession.get(item.getSession().getId()))).toList())
+                    .paymentId(payment == null ? null : payment.getId())
+                    .paymentStatus(payment == null ? ("PACKAGE".equals(b.getPaymentMethod()) ? "Package" : null) : payment.getStatus())
+                    .paymentAmount(payment == null ? null : payment.getAmount())
+                    .requiresReview(payment != null && payment.isRequiresReview())
+                    .canResumePayment(payment != null && "Pending".equals(payment.getStatus()) && "Pending".equals(rawStatus)
+                            && !(hasDirectPayment && hasPackageSessions)
+                            && !payment.isRequiresReview() && payment.getExpiresAt() != null && payment.getExpiresAt().isAfter(LocalDateTime.now(paymentClock))
+                            && ("Card".equals(payment.getMethod()) || "E_Wallet".equals(payment.getMethod())))
+                    .paymentExpiresAt(payment == null || payment.getExpiresAt() == null ? null : payment.getExpiresAt().atOffset(VnpayService.OFFSET))
+                    .bookingId(b.getId())
+                    .classId(classEntity.getId())
+                    .classCode(String.format("CLS-%03d", classEntity.getId()))
+                    .className(classEntity.getName())
+                    .roomName(classEntity.getRoom() != null ? classEntity.getRoom().getName() : "")
+                    .schedule(schedule)
+                    .timeSlot(timeSlot)
+                    .coachName(coachName)
+                    .hasPt(classEntity.isHasPt())
+                    .coachAvatar(coachAvatar)
+                    .status(displayStatus)
+                    .rawStatus(rawStatus)
+                    .classStatus(ClassSchedule.effectiveStatus(classEntity, today))
+                    .sessionStatus(ClassSchedule.sessionStatus(session, today))
+                    .startDate(classEntity.getDate()).durationWeeks(classEntity.getDurationWeeks()).endDate(classEntity.getEndDate())
+                    .sessionId(session.getId()).sessionDate(session.getDate())
+                    .sessionStartTime(session.getStartTime()).sessionEndTime(session.getEndTime())
+                    .canCancel(canCancel)
+                    .canRebook(canRebook)
+                    .bookingDatetime(b.getBookingDatetime())
+                    .paymentMethod(paymentMethod)
+                    .build();
+        }).toList();
+
+        List<MyClassItemResponse> items = allItems.stream()
+                .filter(item -> resolvedStatus == null || resolvedStatus.equalsIgnoreCase(item.getRawStatus()))
+                .filter(item -> keyword == null || java.util.stream.Stream.of(item.getClassName(), item.getCoachName(), item.getRoomName())
+                        .filter(java.util.Objects::nonNull).anyMatch(value -> value.toLowerCase(Locale.ROOT).contains(keyword))).toList();
+        long total = allItems.size();
+        long ongoing = allItems.stream().filter(item -> "Booked".equals(item.getRawStatus())).count();
+        long completed = allItems.stream().filter(item -> "Completed".equals(item.getRawStatus())).count();
+        long cancelled = allItems.stream().filter(item -> "Cancelled".equals(item.getRawStatus())).count();
+
+        return MyClassListResponse.builder()
+                .success(true)
+                .message(ApiMessages.text("class.my.list"))
+                .counts(MyClassListResponse.Counts.builder()
+                        .all(total)
+                        .ongoing(ongoing)
+                        .completed(completed)
+                        .cancelled(cancelled)
+                        .build())
+                .classes(items)
+                .build();
+    }
+
+    private String registrationStatus(List<ClassBooking> group, LocalDate today) {
+        List<String> statuses = group.stream().map(b -> "Pending".equals(b.getStatus()) && b.getPaymentExpiresAt() != null
+                && !b.getPaymentExpiresAt().isAfter(LocalDateTime.now(paymentClock)) ? "Cancelled"
+                : ClassSchedule.bookingStatus(b, today)).toList();
+        if (statuses.contains("Booked")) return "Booked";
+        if (statuses.contains("Pending")) return "Pending";
+        return statuses.contains("Cancelled") ? "Cancelled" : "Completed";
+    }
+
+    private MemberClassSessionData sessionData(ClassSession session, String bookingStatus) {
+        return sessionData(session, bookingStatus, null);
+    }
+
+    private MemberClassSessionData sessionData(ClassSession session, String bookingStatus, String attendanceStatus) {
+        return new MemberClassSessionData(session.getId(), session.getDate(), session.getStartTime(), session.getEndTime(),
+                ClassSchedule.sessionStatus(session, LocalDate.now(paymentClock)), bookingStatus, attendanceStatus);
+    }
+
+    /**
+     * Màn hình 2: "Đăng ký lớp"
+     * Hiển thị thông tin gói hội viên khả dụng và danh sách các lớp học hiện có để học viên tìm kiếm và chọn.
+     */
+    @Transactional(readOnly = true)
+    public AvailableClassListResponse getAvailableClasses(String principal, String search, String category) {
+        User user = findMemberUser(principal);
+        MemberSubscriptionInfoResponse activeSub = getActiveSubscriptionInfo(user);
+
+        List<ClassEntity> allClasses = classRepository.searchClasses(null, null, null);
+
+        String keyword = StringUtils.hasText(search) ? search.trim().toLowerCase(Locale.ROOT) : null;
+        String filterCat = StringUtils.hasText(category) && !"tất cả".equalsIgnoreCase(category.trim())
+                ? category.trim().toLowerCase(Locale.ROOT) : null;
+
+        List<AvailableClassCardResponse> cardList = new ArrayList<>();
+
+        for (ClassEntity c : allClasses) {
+            String cStatus = c.getStatus() != null ? c.getStatus().trim() : "";
+            if ((!"Active".equalsIgnoreCase(cStatus) && !"Open".equalsIgnoreCase(cStatus))
+                    || ClassSchedule.expired(c, LocalDate.now(paymentClock))) {
+                continue;
+            }
+
+            String subjectName = c.getSubject() != null ? c.getSubject().getName() : "";
+            String subjectCategory = c.getSubject() != null && StringUtils.hasText(c.getSubject().getCategory())
+                    ? c.getSubject().getCategory() : subjectName;
+            String coachName = c.getCoach() != null ? c.getCoach().getFullName() : "";
+            String roomName = c.getRoom() != null ? c.getRoom().getName() : "";
+            String className = c.getName() != null ? c.getName() : "";
+
+            if (filterCat != null) {
+                boolean matchCat = subjectName.toLowerCase(Locale.ROOT).contains(filterCat)
+                        || subjectCategory.toLowerCase(Locale.ROOT).contains(filterCat);
+                if (!matchCat) {
+                    continue;
+                }
+            }
+
+            if (keyword != null) {
+                boolean matchKw = className.toLowerCase(Locale.ROOT).contains(keyword)
+                        || coachName.toLowerCase(Locale.ROOT).contains(keyword)
+                        || roomName.toLowerCase(Locale.ROOT).contains(keyword)
+                        || subjectName.toLowerCase(Locale.ROOT).contains(keyword);
+                if (!matchKw) {
+                    continue;
+                }
+            }
+
+            LocalDateTime now = LocalDateTime.now(paymentClock);
+            List<ClassSession> upcoming = classSessionRepository.findUpcomingScheduledSessions(c.getId(), now.toLocalDate()).stream()
+                    .filter(s -> ClassSchedule.bookable(c, s, now)).toList();
+            long enrolledCount = upcoming.stream().mapToLong(s -> classBookingRepository.countReservedMembersBySessionId(s.getId(), now))
+                    .max().orElse(0L);
+            int remainingSlots = upcoming.isEmpty() ? 0 : Math.max(0, c.getMaxCapacity() - (int) enrolledCount);
+            boolean isEnrolled = classBookingRepository.existsActiveBookingByUserIdAndClassId(user.getId(), c.getId(), LocalDateTime.now(paymentClock));
+            ClassSession nextSession = nextBookableSession(c, LocalDateTime.now(paymentClock)).orElse(null);
+            boolean canRegister = ClassSchedule.notStarted(c, now) && remainingSlots > 0 && !isEnrolled && nextSession != null
+                    && reservationService.registrationConflict(user.getId(), c, upcoming, now) == null;
+
+            String capacityUnit = resolveCapacityUnit(subjectName, subjectCategory);
+            String remainingSlotsText = String.format("Còn %d %s", remainingSlots, capacityUnit);
+
+            BigDecimal price = c.getPrice() != null ? c.getPrice() : BigDecimal.ZERO;
+            String priceFormatted = formatCurrency(price) + " đ/buổi";
+
+            String schedule = formatScheduleWithDays(c.getStartTime(), c.getEndTime(), c.getDaysOfWeek());
+
+            cardList.add(AvailableClassCardResponse.builder()
+                    .classId(c.getId())
+                    .classCode(String.format("CLS-%03d", c.getId()))
+                    .name(c.getName())
+                    .subjectId(c.getSubject() != null ? c.getSubject().getId() : null)
+                    .subjectName(subjectName)
+                    .category(subjectCategory)
+                    .description(c.getSubject() != null ? c.getSubject().getDescription() : "")
+                    .schedule(schedule)
+                    .daysOfWeek(String.join(", ", ClassSchedule.normalizeDays(c.getDaysOfWeek())))
+                    .startDate(c.getDate()).durationWeeks(c.getDurationWeeks()).endDate(c.getEndDate())
+                    .sessionId(nextSession != null ? nextSession.getId() : null)
+                    .sessionDate(nextSession != null ? nextSession.getDate() : null)
+                    .sessionStartTime(nextSession != null ? nextSession.getStartTime() : null)
+                    .sessionEndTime(nextSession != null ? nextSession.getEndTime() : null)
+                    .startTime(c.getStartTime())
+                    .endTime(c.getEndTime())
+                    .roomName(roomName)
+                    .coachName("HLV: " + coachName)
+                    .coachAvatar(c.getCoach() != null ? c.getCoach().getAvatarUrl() : null)
+                    .maxCapacity(c.getMaxCapacity())
+                    .enrolledCount((int) enrolledCount)
+                    .remainingSlots(remainingSlots)
+                    .capacityUnit(capacityUnit)
+                    .remainingSlotsText(remainingSlotsText)
+                    .price(price)
+                    .hasPt(c.isHasPt())
+                    .priceFormatted(priceFormatted)
+                    .packageNote("Hoặc trừ 1 buổi gói")
+                    .enrolled(isEnrolled)
+                    .canRegister(canRegister)
+                    .build());
+        }
+
+        Set<String> categories = new LinkedHashSet<>();
+        categories.add("Tất cả");
+        for (Subject s : subjectRepository.findAll()) {
+            if (StringUtils.hasText(s.getName())) {
+                categories.add(s.getName().trim());
+            }
+            if (StringUtils.hasText(s.getCategory())) {
+                categories.add(s.getCategory().trim());
+            }
+        }
+
+        return AvailableClassListResponse.builder()
+                .success(true)
+                .message(ApiMessages.text("class.available.list"))
+                .activeSubscription(activeSub)
+                .categories(new ArrayList<>(categories))
+                .totalAvailableClasses(cardList.size())
+                .classes(cardList)
+                .build();
+    }
+
+    /**
+     * Màn hình 3: Pop-up "Xác nhận thông tin đặt lớp"
+     * Trả về thông tin chi tiết lớp cùng 2 phương thức thanh toán để học viên lựa chọn.
+     */
+    @Transactional(readOnly = true)
+    public ClassConfirmationDetailResponse getClassConfirmationDetail(String principal, Integer classId) {
+        User user = findMemberUser(principal);
+        ClassEntity classEntity = classRepository.findById(classId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, ApiMessages.text("class.notFound", classId)));
+
+        List<ClassSession> courseSessions = remainingSessions(classEntity, LocalDateTime.now(paymentClock));
+        reservationService.validateMemberSchedule(user.getId(), classEntity, courseSessions, LocalDateTime.now(paymentClock));
+        ClassSession nextSession = courseSessions.getFirst();
+
+        MemberSubscriptionInfoResponse subInfo = getActiveSubscriptionInfo(user);
+
+        BigDecimal price = classEntity.getPrice() != null ? classEntity.getPrice() : BigDecimal.ZERO;
+        String priceFormatted = formatCurrency(price) + " đ";
+
+        String schedule = formatScheduleWithDays(classEntity.getStartTime(), classEntity.getEndTime(), classEntity.getDaysOfWeek());
+        String coachName = classEntity.getCoach() != null ? classEntity.getCoach().getFullName() : "Chưa cập nhật";
+        String roomName = classEntity.getRoom() != null ? classEntity.getRoom().getName() : "Chưa xác định";
+
+        String description = (classEntity.getSubject() != null && StringUtils.hasText(classEntity.getSubject().getDescription()))
+                ? classEntity.getSubject().getDescription()
+                : "Chuỗi bài tập bài bản được hướng dẫn trực tiếp bởi Huấn luyện viên, giúp nâng cao thể lực và sự dẻo dai.";
+
+        boolean packageCoversCourse = subInfo.isHasActivePackage() && subInfo.getStartDate() != null
+                && !subInfo.getStartDate().isAfter(LocalDate.now(paymentClock)) && subInfo.getEndDate() != null
+                && !courseSessions.getLast().getDate().isAfter(subInfo.getEndDate())
+                && hasPackageSport(user, classEntity);
+        ClassConfirmationDetailResponse.PackagePaymentOption packageOption = ClassConfirmationDetailResponse.PackagePaymentOption.builder()
+                .eligible(packageCoversCourse)
+                .title("Sử dụng gói hội viên")
+                .subtitle(packageCoversCourse ? "Được học toàn bộ khóa, không giới hạn số buổi"
+                        : "Gói phải đúng môn và có hiệu lực đến buổi cuối")
+                .packageName(subInfo.getPackageName())
+                .note("Không trừ lượt khi đăng ký hoặc tham gia lớp học.")
+                .build();
+
+        ClassConfirmationDetailResponse.DirectPaymentOption directOption = ClassConfirmationDetailResponse.DirectPaymentOption.builder()
+                .available(true)
+                .title("Thanh toán trực tiếp")
+                .subtitle("Thẻ / QR / Chuyển khoản")
+                .amount(price.multiply(BigDecimal.valueOf(courseSessions.size())))
+                .amountFormatted(formatCurrency(price.multiply(BigDecimal.valueOf(courseSessions.size()))) + " đ")
+                .build();
+
+        return ClassConfirmationDetailResponse.builder()
+                .sessionCount(courseSessions.size()).totalAmount(price.multiply(BigDecimal.valueOf(courseSessions.size())))
+                .sessions(courseSessions.stream().map(s -> sessionData(s, null)).toList())
+                .success(true)
+                .message(ApiMessages.text("class.registration.loaded"))
+                .classId(classEntity.getId())
+                .classCode(String.format("CLS-%03d", classEntity.getId()))
+                .className(classEntity.getName())
+                .startDate(classEntity.getDate()).durationWeeks(classEntity.getDurationWeeks()).endDate(classEntity.getEndDate())
+                .sessionId(nextSession.getId()).sessionDate(nextSession.getDate())
+                .sessionStartTime(nextSession.getStartTime()).sessionEndTime(nextSession.getEndTime())
+                .schedule(schedule)
+                .roomName(roomName)
+                .coachName(coachName)
+                .hasPt(classEntity.isHasPt())
+                .price(price)
+                .priceFormatted(priceFormatted)
+                .description(description)
+                .packageOption(packageOption)
+                .directPaymentOption(directOption)
+                .build();
+    }
+
+    /**
+     * Thực hiện Đăng ký lớp với 1 trong 2 hình thức thanh toán:
+     * - Sử dụng gói hội viên (PACKAGE)
+     * - Thanh toán trực tiếp (DIRECT)
+     */
+    @Transactional
+    public MemberClassBookingResponse registerClass(String principal, Integer targetClassId, MemberClassBookingRequest request, String ipAddress) {
+        User user = findMemberUser(principal);
+        // Serialize registration with membership purchases and renewals for this member.
+        userRepository.findByIdForUpdate(user.getId()).orElseThrow();
+
+        Integer classId = targetClassId != null ? targetClassId : request.getClassId();
+        if (classId == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.id.required"));
+        }
+
+        ClassEntity classEntity = classRepository.findByIdForUpdate(classId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, ApiMessages.text("class.notFound", classId)));
+        LocalDateTime now = LocalDateTime.now(paymentClock).withNano(0);
+
+        if (!ClassSchedule.notStarted(classEntity, now)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.registration.notStarted"));
+        }
+
+        String status = classEntity.getStatus() != null ? classEntity.getStatus().trim() : "";
+        if ((!"Active".equalsIgnoreCase(status) && !"Open".equalsIgnoreCase(status))
+                || ClassSchedule.expired(classEntity, now.toLocalDate())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.notOpen", status));
+        }
+
+        reservationService.expirePending(classId, now);
+        if (classBookingRepository.existsActiveBookingByUserIdAndClassId(user.getId(), classEntity.getId(), now)) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, ApiMessages.text("class.alreadyBooked"));
+        }
+
+        List<ClassSession> courseSessions = remainingSessions(classEntity, now);
+        reservationService.validateMemberSchedule(user.getId(), classEntity, courseSessions, now);
+        for (ClassSession selected : courseSessions) {
+            if (classBookingRepository.countReservedMembersBySessionId(selected.getId(), now) >= classEntity.getMaxCapacity()) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.session.full", selected.getDate()));
+            }
+        }
+
+        String rawMethod = request.getPaymentMethod();
+        if (!StringUtils.hasText(rawMethod)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.payment.required"));
+        }
+
+        if ("MIXED".equalsIgnoreCase(rawMethod.trim())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.payment.mixed.unsupported"));
+        }
+        boolean isPackage = isPackagePayment(rawMethod);
+        boolean isDirect = isDirectPayment(rawMethod);
+
+        if (!isPackage && !isDirect) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.payment.method"));
+        }
+
+        String channel = isDirect ? normalizePaymentChannel(request.getPaymentChannel()) : null;
+        boolean isCard = isDirect && "Card".equals(channel);
+        boolean isQr = isDirect && "E_Wallet".equals(channel);
+        boolean isOnline = isCard || isQr;
+        BigDecimal unitPrice = classEntity.getPrice() == null ? BigDecimal.ZERO : classEntity.getPrice();
+        BigDecimal paymentAmount = isDirect ? unitPrice.multiply(BigDecimal.valueOf(courseSessions.size())) : null;
+
+        MemberSubscription activeSub = null;
+
+        if (isPackage) {
+            Optional<MemberSubscription> subOpt = memberSubscriptionRepository.findCurrentActiveSubscription(user.getId(), LocalDate.now(paymentClock));
+            if (subOpt.isEmpty()) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.package.inactive"));
+            }
+            activeSub = subOpt.get();
+            if (!hasPackageSport(user, classEntity)) {
+                throw new ResponseStatusException(HttpStatus.FORBIDDEN,
+                        ApiMessages.text("class.package.noSport"));
+            }
+            if (activeSub.getStartDate().isAfter(now.toLocalDate())
+                    || courseSessions.getLast().getDate().isAfter(activeSub.getEndDate())) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.package.term"));
+            }
+        }
+
+        if (paymentAmount != null && (paymentAmount.signum() < 0 || paymentAmount.precision() - paymentAmount.scale() > 10)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.payment.total.invalid"));
+        }
+        if (isOnline) {
+            if (isCard) vnpayService.requireConfigured();
+            else sepayService.requireConfigured();
+            if (paymentAmount == null || paymentAmount.signum() <= 0 || paymentAmount.stripTrailingZeros().scale() > 0) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.payment.vnd.invalid"));
+            }
+        }
+
+        ClassSession session = courseSessions.getFirst();
+        if (!ClassSchedule.bookable(classEntity, session, now)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.session.closed"));
+        }
+        LocalDateTime expiresAt = isOnline ? now.plusMinutes(VnpayService.PAYMENT_TIMEOUT_MINUTES) : null;
+        if (isOnline && expiresAt.isAfter(session.getDate().atTime(session.getStartTime()))) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.payment.notice"));
+        }
+        String registrationCode = UUID.randomUUID().toString();
+        List<ClassBooking> registration = new ArrayList<>();
+        for (ClassSession selected : courseSessions) {
+            registration.add(classBookingRepository.save(ClassBooking.builder().user(user).session(selected)
+                    .registrationCode(registrationCode).bookingDatetime(now).status(isOnline ? "Pending" : "Booked")
+                    .paymentMethod(isPackage ? "PACKAGE" : "DIRECT").paymentExpiresAt(expiresAt).build()));
+        }
+        ClassBooking savedBooking = registration.getFirst();
+
+        Payment savedPayment = null;
+        String paymentUrl = null;
+        if (isDirect) {
+            Payment payment = Payment.builder()
+                    .booking(savedBooking)
+                    .paymentType("Class_Booking")
+                    .amount(paymentAmount)
+                    .method(channel)
+                    .paymentDate(now)
+                    .expiresAt(expiresAt)
+                    .status(isOnline ? "Pending" : "Paid")
+                    .discountAmount(BigDecimal.ZERO)
+                    .build();
+            savedPayment = paymentRepository.save(payment);
+            if (isCard) paymentUrl = vnpayService.createPaymentUrl(savedPayment, ipAddress);
+
+            logActivity(
+                    user,
+                    "CREATE_PAYMENT",
+                    "Payment",
+                    String.format("Tạo thanh toán trực tiếp #PAY-%s cho lớp '%s' số tiền %s VND (Phương thức: %s, Trạng thái: %s)",
+                            savedPayment.getId() != null ? savedPayment.getId() : "NEW",
+                            classEntity.getName(),
+                            formatCurrency(paymentAmount),
+                            channel,
+                            isOnline ? "Pending" : "Paid")
+            );
+        }
+
+        logActivity(
+                user,
+                "BOOK_CLASS",
+                "Class_Booking",
+                String.format("Hội viên %s đặt lớp '%s' qua hình thức %s",
+                        user.getFullName(),
+                        classEntity.getName(),
+                        isPackage ? "Sử dụng gói hội viên" : "Thanh toán trực tiếp")
+        );
+
+        String paymentMethodDisplay = isPackage ? "Sử dụng gói hội viên" : "Thanh toán trực tiếp";
+        String schedule = formatScheduleWithDays(classEntity.getStartTime(), classEntity.getEndTime(), classEntity.getDaysOfWeek());
+
+        return MemberClassBookingResponse.builder()
+                .registrationId(savedBooking.getId()).sessionCount(courseSessions.size())
+                .sessions(courseSessions.stream().map(s -> sessionData(s, isOnline ? "Pending" : "Booked")).toList())
+                .success(true)
+                .message(isOnline ? ApiMessages.text(isQr ? "class.payment.qr" : "class.payment.vnpay")
+                        : ApiMessages.text("class.registered"))
+                .bookingId(savedBooking.getId())
+                .startDate(classEntity.getDate()).durationWeeks(classEntity.getDurationWeeks()).endDate(classEntity.getEndDate())
+                .sessionId(session.getId()).sessionDate(session.getDate())
+                .sessionStartTime(session.getStartTime()).sessionEndTime(session.getEndTime())
+                .classId(classEntity.getId())
+                .classCode(String.format("CLS-%03d", classEntity.getId()))
+                .className(classEntity.getName())
+                .hasPt(classEntity.isHasPt())
+                .schedule(schedule)
+                .roomName(classEntity.getRoom() != null ? classEntity.getRoom().getName() : "")
+                .coachName(classEntity.getCoach() != null ? classEntity.getCoach().getFullName() : "")
+                .paymentMethod(paymentMethodDisplay)
+                .paymentAmount(paymentAmount)
+                .bookingStatus(isOnline ? "Chờ thanh toán" : "Đang diễn ra")
+                .paymentId(savedPayment != null ? savedPayment.getId() : null)
+                .paymentStatus(savedPayment != null ? savedPayment.getStatus() : null)
+                .paymentUrl(paymentUrl)
+                .expiresAt(expiresAt != null ? expiresAt.atOffset(VnpayService.OFFSET) : null)
+                .bookingDatetime(savedBooking.getBookingDatetime())
+                .build();
+    }
+
+    /**
+     * Hủy đăng ký lớp học (Thao tác ở màn hình Lớp học của tôi).
+     */
+    @Transactional
+    public void cancelClassBooking(String principal, Integer bookingId) {
+        cancelClassBooking(principal, bookingId, null);
+    }
+
+    @Transactional(readOnly = true)
+    public com.swp391.beswp.dto.RefundDtos.CancellationPreview cancellationPreview(String principal, Integer bookingId) {
+        User user = findMemberUser(principal);
+        ClassBooking booking = classBookingRepository.findByIdAndUser_Id(bookingId, user.getId())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, ApiMessages.text("class.booking.notFound")));
+        List<ClassBooking> registration = cancellableRegistration(booking);
+        return refunds.preview(bookingId, registration, paymentRepository.findAllByBooking_IdOrderByIdDesc(registration.getFirst().getId()));
+    }
+
+    private List<ClassBooking> cancellableRegistration(ClassBooking booking) {
+        if (ClassSchedule.expired(booking.getSession().getClassEntity(), LocalDate.now(paymentClock))) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.cancel.expired"));
+        }
+        List<ClassBooking> registration = reservationService.registrationBookings(booking);
+        LocalDateTime now = LocalDateTime.now(paymentClock);
+        if (firstSessionStart(registration) == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.cancel.notStarted"));
+        }
+        if (!cancellationWindowOpen(registration, now)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.cancel.window"));
+        }
+        if (registration.stream().noneMatch(b -> ("Booked".equals(b.getStatus()) || "Pending".equals(b.getStatus()))
+                && b.getSession().getDate().atTime(b.getSession().getStartTime()).isAfter(now))) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.cancel.noneFuture"));
+        }
+        return registration;
+    }
+
+    private boolean cancellationWindowOpen(List<ClassBooking> registration, LocalDateTime now) {
+        LocalDateTime firstSessionStart = firstSessionStart(registration);
+        return firstSessionStart != null && firstSessionStart.isAfter(now.plusDays(3));
+    }
+
+    private LocalDateTime firstSessionStart(List<ClassBooking> registration) {
+        return registration.stream()
+                .map(ClassBooking::getSession)
+                .filter(Objects::nonNull)
+                .filter(session -> session.getDate() != null && session.getStartTime() != null)
+                .map(session -> session.getDate().atTime(session.getStartTime()))
+                .min(LocalDateTime::compareTo)
+                .orElse(null);
+    }
+
+    @Transactional
+    public void cancelClassBooking(String principal, Integer bookingId, com.swp391.beswp.dto.RefundDtos.CancelConfirmation confirmation) {
+        User user = findMemberUser(principal);
+
+        Integer classId = classBookingRepository.findOwnedClassId(bookingId, user.getId())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, ApiMessages.text("class.booking.notFound")));
+        classRepository.findByIdForUpdate(classId).orElseThrow();
+
+        ClassBooking booking = classBookingRepository.findByIdAndUser_Id(bookingId, user.getId())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, ApiMessages.text("class.booking.detail.notFound")));
+
+        List<ClassBooking> registration = cancellableRegistration(booking);
+        ClassBooking root = registration.getFirst();
+        LocalDateTime now = LocalDateTime.now(paymentClock);
+        Set<Integer> cancelledIds = registration.stream().filter(b -> ("Booked".equals(b.getStatus()) || "Pending".equals(b.getStatus()))
+                && b.getSession().getDate().atTime(b.getSession().getStartTime()).isAfter(now))
+                .map(ClassBooking::getId).collect(java.util.stream.Collectors.toSet());
+        List<Payment> attempts = paymentRepository.findAllByBooking_IdOrderByIdDesc(root.getId());
+        if (confirmation != null) {
+            var preview = refunds.preview(bookingId, registration, attempts);
+            if (confirmation.estimatedRefund().compareTo(preview.estimatedRefund()) != 0 || confirmation.cancelSessions() != preview.cancelSessions()) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, ApiMessages.text("class.cancel.changed"));
+            }
+        }
+        for (ClassBooking item : registration) {
+            if ("Booked".equals(item.getStatus()) || "Pending".equals(item.getStatus())) {
+                item.setStatus(item.getSession().getDate().atTime(item.getSession().getStartTime()).isAfter(now)
+                        ? "Cancelled" : "Completed");
+            }
+        }
+
+        String className = booking.getSession() != null && booking.getSession().getClassEntity() != null
+                ? booking.getSession().getClassEntity().getName() : "lớp học";
+
+        for (Payment payment : attempts) {
+            if ("Pending".equals(payment.getStatus())) payment.setStatus("Failed");
+            if ("Paid".equals(payment.getStatus())) {
+                refunds.createForCancellation(payment, registration, cancelledIds, user);
+            }
+        }
+
+        logActivity(
+                user,
+                "CANCEL_BOOKING",
+                "Class_Booking",
+                String.format("Hội viên %s hủy đặt lớp '%s'", user.getFullName(), className)
+        );
+    }
+
+    /**
+     * Lấy thông tin trạng thái gói hội viên đang hoạt động của học viên.
+     */
+    @Transactional(readOnly = true)
+    public MemberSubscriptionInfoResponse getActiveSubscriptionInfo(User user) {
+        Optional<MemberSubscription> subOpt = memberSubscriptionRepository.findCurrentActiveSubscription(user.getId(), LocalDate.now(paymentClock));
+        if (subOpt.isEmpty()) {
+            return MemberSubscriptionInfoResponse.builder()
+                    .hasActivePackage(false)
+                    .displayBanner("Chưa có gói hội viên khả dụng")
+                    .build();
+        }
+
+        MemberSubscription sub = subOpt.get();
+        String packageName = sub.getMembershipPackage() != null ? sub.getMembershipPackage().getName() : "Gói hội viên";
+        String banner = String.format("Gói hội viên khả dụng: %s (Không giới hạn số buổi)", packageName);
+
+        return MemberSubscriptionInfoResponse.builder()
+                .hasActivePackage(true)
+                .subscriptionId(sub.getId())
+                .packageId(sub.getMembershipPackage() != null ? sub.getMembershipPackage().getId() : null)
+                .packageName(packageName)
+                .startDate(sub.getStartDate())
+                .endDate(sub.getEndDate())
+                .displayBanner(banner)
+                .build();
+    }
+
+    boolean hasPackageSport(User user, ClassEntity course) {
+        Integer subjectId = course.getSubject() == null ? null : course.getSubject().getId();
+        LocalDate today = LocalDate.now(paymentClock);
+        return subjectId != null && (membershipIncludedSports.hasActiveIncludedEntitlement(user.getId(), subjectId, today)
+                || membershipSelections.hasActiveSelectedEntitlement(user.getId(), subjectId, today));
+    }
+
+    User findMemberUser(String principal) {
+        if (!StringUtils.hasText(principal)) {
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, ApiMessages.text("class.login.required"));
+        }
+
+        User member;
+        try {
+            Integer userId = Integer.valueOf(principal);
+            member = userRepository.findById(userId)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, ApiMessages.text("class.member.notFound")));
+        } catch (NumberFormatException ignored) {
+            member = userRepository.findByUsernameIgnoreCase(principal)
+                    .or(() -> userRepository.findByEmailIgnoreCase(principal))
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, ApiMessages.text("class.member.notFound")));
+        }
+        if (member.getRole() == null || !"Member".equalsIgnoreCase(member.getRole().getRoleName())) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, ApiMessages.text("class.member.only"));
+        }
+        return member;
+    }
+
+    private Optional<ClassSession> nextBookableSession(ClassEntity classEntity, LocalDateTime now) {
+        if (!ClassSchedule.isOpen(classEntity) || ClassSchedule.expired(classEntity, now.toLocalDate())) return Optional.empty();
+        return classSessionRepository.findUpcomingScheduledSessions(classEntity.getId(), now.toLocalDate()).stream()
+                .filter(s -> ClassSchedule.bookable(classEntity, s, now))
+                .min(java.util.Comparator.comparing((ClassSession s) -> s.getDate()).thenComparing(ClassSession::getStartTime));
+    }
+
+    private List<ClassSession> remainingSessions(ClassEntity classEntity, LocalDateTime now) {
+        if (!ClassSchedule.notStarted(classEntity, now)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.registration.notStarted"));
+        }
+        List<ClassSession> sessions = classSessionRepository.findUpcomingScheduledSessions(classEntity.getId(), now.toLocalDate())
+                .stream().filter(s -> ClassSchedule.bookable(classEntity, s, now))
+                .sorted(Comparator.comparing(ClassSession::getDate).thenComparing(ClassSession::getStartTime)).toList();
+        if (sessions.isEmpty()) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ApiMessages.text("class.sessions.empty"));
+        return sessions;
+    }
+
+    private boolean isPackagePayment(String method) {
+        String s = method.trim().toLowerCase(Locale.ROOT);
+        return s.contains("package") || s.contains("gói") || s.contains("goi");
+    }
+
+    private boolean isDirectPayment(String method) {
+        String s = method.trim().toLowerCase(Locale.ROOT);
+        return s.contains("direct") || s.contains("trực tiếp") || s.contains("truc tiep")
+                || s.contains("cash") || s.contains("bank") || s.contains("card") || s.contains("wallet");
+    }
+
+    private String normalizePaymentChannel(String raw) {
+        if (!StringUtils.hasText(raw)) {
+            return "Bank_Transfer";
+        }
+        String s = raw.trim().toLowerCase(Locale.ROOT);
+        if (s.contains("cash") || s.contains("tiền mặt")) return "Cash";
+        if (s.contains("card") || s.contains("thẻ")) return "Card";
+        if (s.contains("wallet") || s.contains("ví")) return "E_Wallet";
+        return "Bank_Transfer";
+    }
+
+    private String resolveBookingStatusQuery(String status) {
+        if (!StringUtils.hasText(status) || "all".equalsIgnoreCase(status) || "tất cả".equalsIgnoreCase(status)) {
+            return null;
+        }
+        String s = status.trim().toLowerCase(Locale.ROOT);
+        if (s.contains("ongoing") || s.contains("diễn ra") || s.contains("dien ra") || s.contains("booked") || s.contains("active")) {
+            return "Booked";
+        }
+        if (s.contains("completed") || s.contains("hoàn thành") || s.contains("hoan thanh")) {
+            return "Completed";
+        }
+        if (s.contains("cancel") || s.contains("hủy") || s.contains("huy")) {
+            return "Cancelled";
+        }
+        return status.trim();
+    }
+
+    private String mapBookingDisplayStatus(String raw) {
+        if (raw == null) return "Đang diễn ra";
+        return switch (raw.toLowerCase(Locale.ROOT)) {
+            case "booked" -> "Đang diễn ra";
+            case "pending" -> "Chờ thanh toán";
+            case "completed" -> "Đã hoàn thành";
+            case "cancelled" -> "Đã hủy";
+            default -> raw;
+        };
+    }
+
+    private String resolveCapacityUnit(String subjectName, String category) {
+        String combined = (subjectName + " " + category).toLowerCase(Locale.ROOT);
+        if (combined.contains("yoga") || combined.contains("thiền") || combined.contains("thien")) {
+            return "thảm";
+        }
+        if (combined.contains("pilates")) {
+            return "máy";
+        }
+        return "chỗ";
+    }
+
+    private String formatScheduleWithDays(LocalTime start, LocalTime end, String days) {
+        String range = formatTimeRange(start, end);
+        if (StringUtils.hasText(days)) {
+            return String.format("%s (%s)", range, String.join(", ", ClassSchedule.normalizeDays(days)));
+        }
+        return range;
+    }
+
+    private String formatTimeRange(LocalTime start, LocalTime end) {
+        if (start != null && end != null) {
+            return String.format("%02d:%02d - %02d:%02d", start.getHour(), start.getMinute(), end.getHour(), end.getMinute());
+        }
+        return "Linh hoạt";
+    }
+
+    private String formatCurrency(BigDecimal amount) {
+        if (amount == null) return "0";
+        return CURRENCY_FORMAT.format(amount);
+    }
+
+    private String getInitials(String fullName) {
+        if (!StringUtils.hasText(fullName)) return "HLV";
+        String[] parts = fullName.trim().split("\\s+");
+        if (parts.length == 1) {
+            return parts[0].substring(0, Math.min(2, parts[0].length())).toUpperCase(Locale.ROOT);
+        }
+        return (parts[0].substring(0, 1) + parts[parts.length - 1].substring(0, 1)).toUpperCase(Locale.ROOT);
+    }
+
+    private void logActivity(User user, String action, String target, String desc) {
+        try {
+            ActivityLog log = ActivityLog.builder()
+                    .user(user)
+                    .actionType(action)
+                    .targetEntity(target)
+                    .description(desc)
+                    .createdAt(LocalDateTime.now())
+                    .build();
+            activityLogRepository.save(log);
+        } catch (Exception ignored) {
+            // Không làm gián đoạn flow chính nếu bảng log có vấn đề
+        }
+    }
+}

@@ -1,0 +1,104 @@
+package com.swp391.beswp.dto;
+
+import com.swp391.beswp.entity.MembershipPackage;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+
+import java.math.BigDecimal;
+import java.util.List;
+
+@Getter
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+public class PackageResponse {
+
+    private boolean success;
+    private String message;
+    private PackageData data;
+
+    public static PackageResponse success(String message, MembershipPackage pkg) {
+        return new PackageResponse(true, message, PackageData.fromEntity(pkg));
+    }
+
+    public static PackageResponse success(String message, PackageData data) {
+        return new PackageResponse(true, message, data);
+    }
+
+    @Getter
+    @AllArgsConstructor
+    @NoArgsConstructor
+    @Builder
+    public static class PackageData {
+
+        /** Mã gói định dạng PKG-001, PKG-002, ... */
+        private String code;
+        private Integer id;
+        private String name;
+        private String description;
+        private BigDecimal price;
+        private BigDecimal discount;
+
+        /** Thời gian hiệu lực lưu theo số ngày trong DB */
+        private Integer durationDays;
+
+        /**
+         * Thời gian hiệu lực quy đổi sang tháng (để FE hiển thị).
+         * Dùng công thức làm tròn: tháng = round(days / 30).
+         */
+        private Integer durationMonths;
+
+        private Integer freezeMonths;
+        private String freezeTerms;
+
+        private String benefits;
+        private String termConditions;
+        private String status;
+        private String statusLabel;
+        private List<SportData> includedSports;
+        private List<ChoiceGroupData> choiceGroups;
+
+        public static PackageData fromEntity(MembershipPackage pkg) {
+            if (pkg == null) return null;
+
+            int days = pkg.getDuration() != null ? pkg.getDuration() : 0;
+            int months = (int) Math.round(days / 30.0);
+
+            String statusLabel = "Active".equalsIgnoreCase(pkg.getStatus())
+                    ? "Đang mở bán"
+                    : "Tạm ngưng cung cấp";
+
+            return PackageData.builder()
+                    .id(pkg.getId())
+                    .code(String.format("PKG-%02d", pkg.getId()))
+                    .name(pkg.getName())
+                    .description(pkg.getDescription())
+                    .price(pkg.getPrice())
+                    .discount(pkg.getDiscount())
+                    .durationDays(days)
+                    .durationMonths(months)
+                    .freezeMonths(pkg.getFreezeMonths())
+                    .freezeTerms(pkg.getFreezeMonths() > 0 ? com.swp391.beswp.service.MembershipFreezePolicy.TERMS : null)
+                    .benefits(pkg.getBenefits())
+                    .termConditions(pkg.getTermConditions())
+                    .status(pkg.getStatus())
+                    .statusLabel(statusLabel)
+                    .build();
+        }
+    }
+
+    @Getter @AllArgsConstructor @NoArgsConstructor @Builder
+    public static class SportData { private Integer id; private String name; }
+
+    @Getter @AllArgsConstructor @NoArgsConstructor @Builder
+    public static class ChoiceGroupData {
+        private Integer id;
+        private String name;
+        private String description;
+        private Integer requiredSelection;
+        private Integer sortOrder;
+        private List<SportData> sports;
+    }
+}

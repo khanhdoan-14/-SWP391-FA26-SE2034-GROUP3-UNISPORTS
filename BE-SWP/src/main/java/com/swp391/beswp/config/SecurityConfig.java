@@ -1,0 +1,145 @@
+package com.swp391.beswp.config;
+
+import com.swp391.beswp.dto.ErrorResponse;
+import tools.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.oauth2.client.registration.ClientRegistrationRepository;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.security.web.util.matcher.RequestMatcher;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.List;
+
+@Configuration
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtAuthenticationFilter jwtAuthenticationFilter;
+    private final GoogleOAuth2SuccessHandler googleOAuth2SuccessHandler;
+    private final GoogleOAuth2FailureHandler googleOAuth2FailureHandler;
+
+    @Value("${app.cors.allowed-origins}")
+    private String[] allowedOrigins;
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(
+            HttpSecurity http,
+            ObjectMapper objectMapper,
+            ObjectProvider<ClientRegistrationRepository> clientRegistrationRepositories
+    ) throws Exception {
+        RequestMatcher memberEndpoints = request ->
+                ("POST".equals(request.getMethod()) && "/api/receptionist/members".equals(request.getServletPath()))
+                || ("GET".equals(request.getMethod()) && ("/api/receptionist/members".equals(request.getServletPath())
+                || request.getServletPath().startsWith("/api/receptionist/members/")))
+                || request.getServletPath().startsWith("/api/member/payments/")
+                || request.getServletPath().startsWith("/api/users/me/email-change/")
+                || request.getServletPath().startsWith("/api/receptionist/registrations/");
+        HttpSecurity security = http
+                .csrf(AbstractHttpConfigurer::disable)
+                .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+                .formLogin(AbstractHttpConfigurer::disable)
+                .httpBasic(AbstractHttpConfigurer::disable)
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .exceptionHandling(errors -> errors
+                        .defaultAuthenticationEntryPointFor((request, response, exception) -> {
+                            response.setStatus(401);
+                            response.setContentType("application/json");
+                            objectMapper.writeValue(response.getWriter(), ErrorResponse.fail("Unauthorized"));
+                        }, memberEndpoints)
+                        .defaultAccessDeniedHandlerFor((request, response, exception) -> {
+                            response.setStatus(403);
+                            response.setContentType("application/json");
+                            objectMapper.writeValue(response.getWriter(), ErrorResponse.fail("Forbidden"));
+                        }, memberEndpoints))
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/auth/register").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/auth/register/verify", "/api/auth/register/resend",
+                                "/api/auth/email-verification/request", "/api/auth/email-verification/verify",
+                                "/api/auth/email-verification/change-email/request", "/api/auth/email-verification/change-email/resend",
+                                "/api/auth/email-verification/change-email/verify",
+                                "/api/auth/forgot-password", "/api/auth/forgot-password/resend",
+                                "/api/auth/forgot-password/verify", "/api/auth/reset-password").permitAll()
+                        .requestMatchers("/api/admin/account-identities/**").hasAuthority("ROLE_Admin")
+                        .requestMatchers(HttpMethod.POST, "/api/payments/sepay/webhook").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/receptionist/members").hasAuthority("ROLE_Receptionist")
+                        .requestMatchers(HttpMethod.GET, "/api/receptionist/members", "/api/receptionist/members/**").hasAuthority("ROLE_Receptionist")
+                        .requestMatchers(HttpMethod.GET, "/api/auth/google/exchange").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/payments/vnpay/ipn", "/api/payments/vnpay/return").permitAll()
+                        .requestMatchers("/ws/**").permitAll()
+                        .requestMatchers("/api/chat/**").hasAnyAuthority("ROLE_Member", "ROLE_Coach")
+                        .requestMatchers(HttpMethod.GET, "/api/member/payments/**").hasAuthority("ROLE_Member")
+                        .requestMatchers(HttpMethod.POST, "/api/member/payments/*/resume").hasAuthority("ROLE_Member")
+                        .requestMatchers("/api/member/notifications/**").hasAuthority("ROLE_Member")
+                        .requestMatchers("/oauth2/**", "/login/oauth2/**").permitAll()
+                        .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
+                        .requestMatchers("/error").permitAll()
+                        .requestMatchers("/api/rooms/**").hasAnyAuthority("ROLE_Center Manager", "ROLE_Admin")
+                        .requestMatchers(HttpMethod.PUT, "/api/subjects/**").hasAnyAuthority("ROLE_Center Manager", "ROLE_Admin")
+                        .requestMatchers(HttpMethod.POST, "/api/subjects/**").hasAnyAuthority("ROLE_Center Manager", "ROLE_Admin")
+                        .requestMatchers(HttpMethod.DELETE, "/api/subjects/**").hasAnyAuthority("ROLE_Center Manager", "ROLE_Admin")
+                        .requestMatchers(HttpMethod.GET, "/api/subjects/**").authenticated()
+                        .requestMatchers(HttpMethod.POST, "/api/classes/**").hasAnyAuthority("ROLE_Center Manager", "ROLE_Admin")
+                        .requestMatchers(HttpMethod.DELETE, "/api/classes/**").hasAnyAuthority("ROLE_Center Manager", "ROLE_Admin")
+                        .requestMatchers(HttpMethod.GET, "/api/classes/**").authenticated()
+                        .requestMatchers(HttpMethod.POST, "/api/packages/**").hasAnyAuthority("ROLE_Center Manager", "ROLE_Admin")
+                        .requestMatchers(HttpMethod.PUT, "/api/packages/**").hasAnyAuthority("ROLE_Center Manager", "ROLE_Admin")
+                        .requestMatchers(HttpMethod.DELETE, "/api/packages/**").hasAnyAuthority("ROLE_Center Manager", "ROLE_Admin")
+                        .requestMatchers("/api/center-manager/memberships/**").hasAnyAuthority("ROLE_Center Manager", "ROLE_Admin")
+                        .requestMatchers("/api/center-manager/refunds/**").hasAuthority("ROLE_Center Manager")
+                        .requestMatchers("/api/receptionist/refunds/**").hasAuthority("ROLE_Receptionist")
+                        .requestMatchers(HttpMethod.GET, "/api/packages/**").authenticated()
+                        .requestMatchers("/api/receptionist/registrations/**").hasAuthority("ROLE_Receptionist")
+                        .requestMatchers("/api/member/**").hasAnyAuthority("ROLE_Member", "ROLE_Admin")
+                        .requestMatchers("/api/coach/**").hasAnyAuthority("ROLE_Coach", "ROLE_Admin", "ROLE_Center Manager")
+                        .requestMatchers("/api/admin/audit-logs/**", "/api/audit-logs/**").hasAnyAuthority("ROLE_Admin", "ROLE_Center Manager")
+                        .anyRequest().authenticated()
+                );
+
+        if (clientRegistrationRepositories.getIfAvailable() != null) {
+            security.oauth2Login(oauth2 -> oauth2
+                        .successHandler(googleOAuth2SuccessHandler)
+                        .failureHandler(googleOAuth2FailureHandler)
+            );
+        }
+
+        return security
+                .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
+                .build();
+    }
+
+    @Bean
+    public UserDetailsService userDetailsService() {
+        return username -> {
+            throw new UsernameNotFoundException(username);
+        };
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration configuration = new CorsConfiguration();
+        configuration.setAllowedOrigins(List.of(allowedOrigins));
+        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        configuration.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+        configuration.setExposedHeaders(List.of("Authorization"));
+        configuration.setAllowCredentials(true);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", configuration);
+        return source;
+    }
+}
